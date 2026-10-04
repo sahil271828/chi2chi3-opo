@@ -890,77 +890,6 @@ def solve_drive_locked_steady_state(system, alpha0=None, t_final=5e-7):
     )
 
 
-def _pump_only_branches(system):
-    """Find pump-only Kerr roots from the scalar cubic balance equation.
-
-    These roots guide the frequency search only. The final state is obtained
-    from the full three-mode IVP and then refined with least squares.
-    """
-    kappa_ext = external_coupling_rates(system)
-    pump_drive = np.sqrt(2.0 * kappa_ext[PUMP]) * system.drive_amplitudes[PUMP]
-    drive_power = float(abs(pump_drive) ** 2)
-    kappa_p = float(system.kappa[PUMP])
-    if kappa_p <= 0.0:
-        raise ValueError("Pump amplitude decay rate must be positive")
-    if drive_power == 0.0:
-        return [0.0 + 0.0j]
-
-    n_upper = drive_power / kappa_p**2
-    alpha_zero = np.zeros(3, dtype=np.complex128)
-    alpha_one = alpha_zero.copy()
-    alpha_one[PUMP] = 1.0
-    delta_zero = float(detunings(alpha_zero, system, 0.0)[PUMP])
-    delta_slope = float(detunings(alpha_one, system, 0.0)[PUMP] - delta_zero)
-    tpa_slope = float(system.tpa[PUMP])
-
-    rate_scale = max(
-        kappa_p, abs(delta_zero), abs(delta_slope) * n_upper,
-        abs(tpa_slope) * n_upper, 1.0,
-    )
-    n_scale = max(n_upper, 1.0)
-    k = kappa_p / rate_scale
-    d = delta_zero / rate_scale
-    q = delta_slope * n_scale / rate_scale
-    t = tpa_slope * n_scale / rate_scale
-    drive_scaled = drive_power / (n_scale * rate_scale**2)
-    coefficients = np.trim_zeros(
-        np.array([t**2 + q**2, 2.0 * (k * t + d * q), k**2 + d**2, -drive_scaled]),
-        trim="f",
-    )
-    scaled_roots = np.roots(coefficients)
-
-    def balance(n_p):
-        alpha = np.zeros(3, dtype=np.complex128)
-        alpha[PUMP] = np.sqrt(max(float(n_p), 0.0))
-        kappa_eff = system.kappa + tpa_losses(alpha, system)
-        delta_p = detunings(alpha, system, 0.0)[PUMP]
-        return float(n_p * (kappa_eff[PUMP]**2 + delta_p**2) - drive_power)
-
-    roots = []
-    for root in scaled_roots:
-        if abs(root.imag) > 1e-8 * max(1.0, abs(root.real)) or root.real < 0.0:
-            continue
-        n_p = float(root.real * n_scale)
-        if abs(balance(n_p)) <= 1e-7 * max(drive_power, 1.0):
-            roots.append(n_p)
-
-    unique_roots = []
-    for n_p in sorted(roots):
-        if not unique_roots or abs(n_p - unique_roots[-1]) > 1e-8 * max(n_p, 1.0):
-            unique_roots.append(n_p)
-
-    branches = []
-    for n_p in unique_roots:
-        alpha_test = np.zeros(3, dtype=np.complex128)
-        alpha_test[PUMP] = np.sqrt(n_p)
-        kappa_eff = system.kappa + tpa_losses(alpha_test, system)
-        delta_p = detunings(alpha_test, system, 0.0)[PUMP]
-        alpha_p = pump_drive / (kappa_eff[PUMP] - 1j * delta_p)
-
-        branches.append(alpha_p)
-    return branches
-
-
 def _unseeded_small_signal_growth(system, alpha_p, signal_frequency_offset):
     """Growth rate of the signal/idler pair about a pump-only solution."""
     alpha = np.array([0.0j, 0.0j, alpha_p], dtype=np.complex128)
@@ -1046,7 +975,7 @@ def solve_unseeded_steady_state(
     alpha0[SIGNAL] *= 1.07
     alpha0[PUMP] *= 0.97
 
-    pump_branches = _pump_only_branches(system)
+    pump_branches = [state[PUMP] for state in pump_only_branches(system, 0.0)]
     if not pump_branches:
         raise RuntimeError("Could not find a self-consistent pump-only solution")
     threshold_candidates = []
@@ -1551,28 +1480,72 @@ def summary_dict(system, steady_state, linearized=None):
     return out
 
 
+def _steady_from_root(system, root, target):
+    """Wrap an enumerated fixed point as a SteadyStateResult (and set the carrier offset)."""
+    system.signal_frequency_offset = float(root.offset)
+    return SteadyStateResult(
+        alpha_ss=root.alpha,
+        residual_norm=float(np.linalg.norm(rhs_complex(root.alpha, system, root.offset))),
+        relative_residual_norm=float(root.rel_residual),
+        transient_state=np.asarray(target, dtype=np.complex128),
+        converged=bool(root.rel_residual <= 1e-8),
+        signal_frequency_offset_rad_s=float(root.offset),
+        frequency_determined=True,
+        oscillating=True,
+        transient_converged=True,
+        transient_time_s=0.0,
+    )
+
+
+def _designed_summary(system, design_kwargs):
+    """Design the oscillating state, enumerate all fixed points, report the stable oscillating root.
+
+    Returns a summary_dict, or None if no stable strongly oscillating root exists.
+    """
+    target = design_oscillating_state(system, **design_kwargs)
+    roots = enumerate_fixed_points(system)
+    classes = [classify_fixed_point(system, r) for r in roots]
+    sel = select_stable_oscillating_root(
+        system, roots, classes, n_signal_target=float(photon_numbers(target)[SIGNAL]))
+    if sel is None:
+        return None
+    steady = _steady_from_root(system, sel[0], target)
+    linearized = linearize_about_steady_state(steady.alpha_ss, system)
+    row = summary_dict(system, steady, linearized)
+    row["n_fixed_points"] = len(roots)
+    row["root_stability"] = sel[1]["label"]
+    return row
+
+
 def scan_phase_match_offsets(
     x_values,
     wavelength_regime="nondegenerate",
     signal_seeded=True,
-    signal_seed_power_W=1e-3,
-    pump_input_power_W=1.0,
-    reference_photon_numbers=None,
+    n_signal=2e6,
+    pump_detuning_over_kappa=2.0,
+    pair_detuning_over_kappa=-0.1,
+    seed_deficit=0.0,
+    seed_offset_over_kappa=0.1,
 ):
-    """Solve and report the actual steady state over requested first-lobe x0 values."""
+    """Stable oscillating root over requested first-lobe x0 values.
+
+    Each point: design_oscillating_state, enumerate_fixed_points, select_stable_oscillating_root.
+    A point without a stable strongly oscillating root gives {"x0": x0, "no_stable_oscillating_root": True}.
+    """
     rows = []
     for x0 in x_values:
         system = default_system(
-            phase_match_offset_x=float(x0),
-            wavelength_regime=wavelength_regime,
-            signal_seeded=signal_seeded,
-            signal_seed_power_W=signal_seed_power_W,
-            pump_input_power_W=pump_input_power_W,
-            reference_photon_numbers=reference_photon_numbers,
+            phase_match_offset_x=float(x0), wavelength_regime=wavelength_regime,
+            signal_seeded=signal_seeded, signal_seed_power_W=0.0 if not signal_seeded else 1e-3,
         )
-        steady = solve_steady_state(system)
-        linearized = linearize_about_steady_state(steady.alpha_ss, system)
-        rows.append(summary_dict(system, steady, linearized))
+        row = _designed_summary(system, dict(
+            n_signal=n_signal, pump_detuning_over_kappa=pump_detuning_over_kappa,
+            pair_detuning_over_kappa=pair_detuning_over_kappa,
+            seed_deficit=seed_deficit if signal_seeded else 0.0,
+            seed_offset_over_kappa=seed_offset_over_kappa if signal_seeded else 0.0))
+        if row is not None:
+            row["x0"] = float(x0)
+        rows.append(row if row is not None else {"x0": float(x0), "no_stable_oscillating_root": True})
     return rows
 
 
@@ -1580,27 +1553,28 @@ def compare_intensity_channels(
     phase_match_offset_x=0.5,
     wavelength_regime="nondegenerate",
     signal_seeded=True,
-    signal_seed_power_W=1e-3,
-    pump_input_power_W=1.0,
-    reference_photon_numbers=None,
+    n_signal=2e6,
+    pump_detuning_over_kappa=2.0,
+    pair_detuning_over_kappa=-0.1,
+    seed_deficit=0.0,
+    seed_offset_over_kappa=0.1,
 ):
-    """Compare self-consistent runs with cavity Kerr A and phase-match Kerr B toggled."""
+    """Stable oscillating root with cavity Kerr A and phase-match Kerr B toggled (same design recipe)."""
     rows = []
     for use_a in (False, True):
         for use_b in (False, True):
             system = default_system(
-                phase_match_offset_x=phase_match_offset_x,
-                wavelength_regime=wavelength_regime,
-                signal_seeded=signal_seeded,
-                signal_seed_power_W=signal_seed_power_W,
-                pump_input_power_W=pump_input_power_W,
-                reference_photon_numbers=reference_photon_numbers,
+                phase_match_offset_x=phase_match_offset_x, wavelength_regime=wavelength_regime,
+                signal_seeded=signal_seeded, signal_seed_power_W=0.0 if not signal_seeded else 1e-3,
+                use_cavity_kerr=use_a, use_phase_match_kerr=use_b,
             )
-            system.use_cavity_kerr = use_a
-            system.use_phase_match_kerr = use_b
-            steady = solve_steady_state(system)
-            linearized = linearize_about_steady_state(steady.alpha_ss, system)
-            rows.append(summary_dict(system, steady, linearized))
+            row = _designed_summary(system, dict(
+                n_signal=n_signal, pump_detuning_over_kappa=pump_detuning_over_kappa,
+                pair_detuning_over_kappa=pair_detuning_over_kappa,
+                seed_deficit=seed_deficit if signal_seeded else 0.0,
+                seed_offset_over_kappa=seed_offset_over_kappa if signal_seeded else 0.0))
+            rows.append(row if row is not None else
+                        {"use_cavity_kerr": use_a, "use_phase_match_kerr": use_b, "no_stable_oscillating_root": True})
     return rows
 
 
@@ -1709,7 +1683,10 @@ def design_oscillating_state(
 
     x0 = float(system.phase_match_offset_x)
     gain = abs(system.g0) * float(sinc_unscaled(x0))
-    n_pump = (1.0 - seed_deficit) * (kap[SIGNAL] * kap[IDLER] + d_mean**2) / gain**2
+    # |kappa_s - i d_s| |kappa_i - i d_i| = kappa_s kappa_i (1 + t^2) with t = d_mean / kappa_s
+    # (d_i = d_mean kappa_i / kappa_s), which equals kappa_s kappa_i + d_mean^2 kappa_i / kappa_s.
+    t_mean = d_mean / kap[SIGNAL]
+    n_pump = (1.0 - seed_deficit) * kap[SIGNAL] * kap[IDLER] * (1.0 + t_mean**2) / gain**2
     a_p, a_s = np.sqrt(n_pump), np.sqrt(n_signal)
     g_phase = system.g0 * np.exp(1j * x0) / abs(system.g0)
     a_i = gain * g_phase * a_p * a_s / (kap[IDLER] - 1j * d_i)
@@ -1717,10 +1694,12 @@ def design_oscillating_state(
     n_target = photon_numbers(target)
 
     # Re-center resonances and the QPM period on the target occupations.
-    system.omega_bare = system.omega_drive / (1.0 + system.cavity_pull.T @ n_target)
+    # Effective resonance omega_bare (1 + pull.n) must equal carrier - detuning at the state.
+    d_ref = np.array([d_i, d_s, d_p], dtype=float)
+    system.omega_bare = (system.omega_drive - d_ref) / (1.0 + system.cavity_pull.T @ n_target)
     system.kerr_rate = system.cavity_pull * system.omega_bare[None, :]
     system.reference_photon_numbers = n_target
-    system.detuning_at_reference = np.array([d_i, d_s, d_p], dtype=float)
+    system.detuning_at_reference = d_ref
     system.signal_frequency_offset = 0.0
     system.delta_k_at_reference = 2.0 * x0 / system.crystal_length
     system.poling_period = qpm_period_for_target_mismatch(
@@ -1802,6 +1781,8 @@ def pump_only_branches(system, signal_frequency_offset=0.0):
 
     Solves the Kerr cubic n [kappa^2 + (A + B n)^2] = |drive|^2 and polishes the roots.
     """
+    if np.any(np.asarray(system.tpa, dtype=float) != 0.0):
+        raise NotImplementedError("pump_only_branches assumes zero TPA")
     kap = float(system.kappa[PUMP])
     drive = np.sqrt(2.0 * external_coupling_rates(system)[PUMP]) * system.drive_amplitudes[PUMP]
     d2 = float(abs(drive) ** 2)
@@ -2499,20 +2480,7 @@ def run_example(
         print(f"operating point: all-roots search, {len(roots)} fixed points in the flux-balance box "
               f"({sum(r.kind == 'oscillating' for r in roots)} oscillating)")
         print_root_table(system, roots, classes, chosen=k_sel)
-        system.signal_frequency_offset = float(root.offset)
-        steady = SteadyStateResult(
-            alpha_ss=root.alpha,
-            residual_norm=float(np.linalg.norm(rhs_complex(root.alpha, system, root.offset))),
-            relative_residual_norm=float(root.rel_residual),
-            transient_state=np.asarray(target, dtype=np.complex128),
-            converged=bool(root.rel_residual <= 1e-8),
-            signal_frequency_offset_rad_s=float(root.offset),
-            frequency_determined=True,
-            oscillating=True,
-            parametric_growth_rate_s_inv=np.nan,
-            transient_converged=True,
-            transient_time_s=0.0,
-        )
+        steady = _steady_from_root(system, root, target)
         report = kerr_shifted_threshold_report(system, steady)
         steady.parametric_growth_rate_s_inv = report["pump_only_pair_growth_rate_s_inv"]
         print("pump-only fixed points [photons]:", report["pump_only_branches_photons"])
